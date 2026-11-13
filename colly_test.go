@@ -1341,7 +1341,7 @@ func TestIgnoreRobotsWhenDisallowed(t *testing.T) {
 
 }
 
-func TestConnectionErrorOnRobotsTxtResultsInError(t *testing.T) {
+func TestConnectionErrorOnRobotsTxtFailsOpen(t *testing.T) {
 	ts := newTestServer()
 	ts.Close() // immediately close the server to force a connection error
 
@@ -1349,8 +1349,202 @@ func TestConnectionErrorOnRobotsTxtResultsInError(t *testing.T) {
 	c.IgnoreRobotsTxt = false
 	err := c.Visit(ts.URL)
 
+	// The page request fails too, but not because robots.txt blocked it.
 	if err == nil {
 		t.Fatal("Error expected")
+	}
+	if errors.Is(err, ErrRobotsTxtBlocked) {
+		t.Fatalf("robots.txt failure must not block the URL, got: %v", err)
+	}
+}
+
+func TestRobotsTxtFetchFailureFailsOpen(t *testing.T) {
+	var robotsHits int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&robotsHits, 1)
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	c := NewCollector(AllowURLRevisit())
+	c.IgnoreRobotsTxt = false
+
+	var visited int
+	c.OnResponse(func(resp *Response) {
+		if string(resp.Body) != "ok" {
+			t.Fatalf("unexpected body: %q", resp.Body)
+		}
+		visited++
+	})
+
+	for i := 0; i < 3; i++ {
+		if err := c.Visit(ts.URL); err != nil {
+			t.Fatalf("visit %d failed: %v", i, err)
+		}
+	}
+	if visited != 3 {
+		t.Fatalf("visited %d pages, want 3", visited)
+	}
+
+	u, _ := url.Parse(ts.URL)
+	entry := c.robotsEntry(u.Host)
+	entry.mu.Lock()
+	failures := entry.failures
+	entry.mu.Unlock()
+	if failures != 1 {
+		t.Fatalf("failures = %d, want 1", failures)
+	}
+	if hits := atomic.LoadInt32(&robotsHits); hits != 1 {
+		t.Fatalf("robots.txt fetched %d times, want 1 (no retry within backoff)", hits)
+	}
+}
+
+func TestRobotsTxtCachedPerHost(t *testing.T) {
+	var robotsHits int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&robotsHits, 1)
+		w.Write([]byte(robotsFile))
+	})
+	mux.HandleFunc("/allowed", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("allowed"))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	c := NewCollector(AllowURLRevisit())
+	c.IgnoreRobotsTxt = false
+
+	for i := 0; i < 3; i++ {
+		if err := c.Visit(ts.URL + "/allowed"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if hits := atomic.LoadInt32(&robotsHits); hits != 1 {
+		t.Fatalf("robots.txt fetched %d times, want 1", hits)
+	}
+}
+
+func TestRobotsTxtCachedPerHostConcurrentFirstVisit(t *testing.T) {
+	var robotsHits int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&robotsHits, 1)
+		time.Sleep(50 * time.Millisecond)
+		w.Write([]byte(robotsFile))
+	})
+	mux.HandleFunc("/allowed", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("allowed"))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	c := NewCollector(Async(true), AllowURLRevisit())
+	c.IgnoreRobotsTxt = false
+
+	for i := 0; i < 5; i++ {
+		if err := c.Visit(ts.URL + "/allowed"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Wait()
+
+	if hits := atomic.LoadInt32(&robotsHits); hits != 1 {
+		t.Fatalf("robots.txt fetched %d times, want 1", hits)
+	}
+}
+
+func TestRobotsTxtRefreshedInBackgroundAfterTTL(t *testing.T) {
+	var robotsHits int32
+	var disallow atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&robotsHits, 1)
+		if disallow.Load() {
+			w.Write([]byte("User-agent: *\nDisallow: /allowed\n"))
+			return
+		}
+		w.Write([]byte("User-agent: *\nAllow: /allowed\n"))
+	})
+	mux.HandleFunc("/allowed", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("allowed"))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	c := NewCollector(AllowURLRevisit())
+	c.IgnoreRobotsTxt = false
+	c.robotsTTL = 50 * time.Millisecond
+
+	if err := c.Visit(ts.URL + "/allowed"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The site changes its rules; cached rules must not be used forever.
+	disallow.Store(true)
+	time.Sleep(80 * time.Millisecond)
+
+	// The stale rules are still served while the refresh runs in background.
+	if err := c.Visit(ts.URL + "/allowed"); err != nil {
+		t.Fatalf("stale rules should still allow the URL: %v", err)
+	}
+
+	// Wait for the background refresh to finish.
+	u, _ := url.Parse(ts.URL)
+	entry := c.robotsEntry(u.Host)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		entry.mu.Lock()
+		refreshing := entry.refreshing
+		entry.mu.Unlock()
+		if !refreshing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background robots.txt refresh did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.Wait()
+
+	if hits := atomic.LoadInt32(&robotsHits); hits != 2 {
+		t.Fatalf("robots.txt fetched %d times, want 2", hits)
+	}
+	err := c.Visit(ts.URL + "/allowed")
+	if !errors.Is(err, ErrRobotsTxtBlocked) {
+		t.Fatalf("refreshed rules should block the URL, got: %v", err)
+	}
+}
+
+func TestRobotsTxtCrawlDelay(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("User-agent: *\nCrawl-delay: 0.2\n"))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	c := NewCollector(AllowURLRevisit())
+	c.IgnoreRobotsTxt = false
+
+	start := time.Now()
+	for i := 0; i < 3; i++ {
+		if err := c.Visit(ts.URL); err != nil {
+			t.Fatal(err)
+		}
+	}
+	elapsed := time.Since(start)
+	// Three requests, two gaps of 200ms each.
+	if elapsed < 350*time.Millisecond {
+		t.Fatalf("Crawl-delay not honored: 3 requests took %v, want >= 350ms", elapsed)
 	}
 }
 

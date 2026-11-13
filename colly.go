@@ -124,9 +124,13 @@ type Collector struct {
 	// Set it to 0 for infinite requests (default).
 	MaxRequests uint32
 
-	store                    storage.Storage
-	debugger                 debug.Debugger
-	robotsMap                map[string]*robotstxt.RobotsData
+	store      storage.Storage
+	debugger   debug.Debugger
+	robotsMap  map[string]*robotsCacheEntry
+	robotsLock *sync.Mutex
+	// robotsTTL overrides robotsCacheTTL when non-zero. It mainly exists
+	// so tests can exercise expiry and refresh without waiting an hour.
+	robotsTTL                time.Duration
 	htmlCallbacks            []*htmlCallbackContainer
 	xmlCallbacks             []*xmlCallbackContainer
 	requestCallbacks         []RequestCallback
@@ -200,6 +204,39 @@ type xmlCallbackContainer struct {
 	Function XMLCallback
 	active   atomic.Bool
 }
+
+// robotsCacheEntry holds the cached robots.txt rules of a single host.
+// Entries are shared between a Collector and its clones, so all state is
+// guarded by the entry's own mutex rather than the Collector lock.
+type robotsCacheEntry struct {
+	mu sync.Mutex
+	// robots is the last successfully parsed rules. It is never nil after
+	// the first check: a failed fetch falls back to allow-all rules.
+	robots *robotstxt.RobotsData
+	// nextRefresh is when the cached rules should be fetched again.
+	nextRefresh time.Time
+	// refreshing is true while a background refresh is in flight.
+	refreshing bool
+	// fetchLock serializes the initial fetch of a host, so concurrent first
+	// requests don't download robots.txt each.
+	fetchLock sync.Mutex
+	// failures is the number of consecutive failed fetches.
+	failures int
+	// delayMu serializes requests of the host to honor Crawl-delay.
+	delayMu sync.Mutex
+	// lastRequest is the time the last request of this host was started,
+	// used to honor robots.txt Crawl-delay.
+	lastRequest time.Time
+}
+
+const (
+	// robotsCacheTTL is how long robots.txt rules are considered fresh.
+	robotsCacheTTL = time.Hour
+	// robotsFailureRetryMin is the delay before retrying a failed fetch.
+	robotsFailureRetryMin = time.Minute
+	// robotsFailureRetryMax caps the retry backoff of consecutive failures.
+	robotsFailureRetryMax = 30 * time.Minute
+)
 
 type cookieJarSerializer struct {
 	store storage.Storage
@@ -511,7 +548,8 @@ func (c *Collector) Init() {
 	c.backend.Client.CheckRedirect = c.checkRedirectFunc()
 	c.wg = &sync.WaitGroup{}
 	c.lock = &sync.RWMutex{}
-	c.robotsMap = make(map[string]*robotstxt.RobotsData)
+	c.robotsMap = make(map[string]*robotsCacheEntry)
+	c.robotsLock = &sync.Mutex{}
 	c.IgnoreRobotsTxt = true
 	c.ID = atomic.AddUint32(&collectorCounter, 1)
 	c.TraceHTTP = false
@@ -862,50 +900,8 @@ func (c *Collector) isDomainAllowed(domain string) bool {
 }
 
 func (c *Collector) checkRobots(u *url.URL) error {
-	c.lock.RLock()
-	robot, ok := c.robotsMap[u.Host]
-	c.lock.RUnlock()
-
-	if !ok {
-		// no robots file cached
-
-		// Prepare request,
-		req, err := http.NewRequest("GET", u.Scheme+"://"+u.Host+"/robots.txt", nil)
-		if err != nil {
-			return err
-		}
-		hdr := http.Header{}
-		if c.Headers != nil {
-			for k, v := range *c.Headers {
-				for _, value := range v {
-					hdr.Add(k, value)
-				}
-			}
-		}
-		if _, ok := hdr["User-Agent"]; !ok {
-			hdr.Set("User-Agent", c.UserAgent)
-		}
-		req.Header = hdr
-		// The Go HTTP API ignores "Host" in the headers, preferring the client
-		// to use the Host field on Request.
-		if hostHeader := hdr.Get("Host"); hostHeader != "" {
-			req.Host = hostHeader
-		}
-
-		resp, err := c.backend.Client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-
-		robot, err = robotstxt.FromResponse(resp)
-		if err != nil {
-			return err
-		}
-		c.lock.Lock()
-		c.robotsMap[u.Host] = robot
-		c.lock.Unlock()
-	}
+	entry := c.robotsEntry(u.Host)
+	robot := c.getRobots(entry, u.Scheme, u.Host)
 
 	uaGroup := robot.FindGroup(c.UserAgent)
 	if uaGroup == nil {
@@ -919,7 +915,181 @@ func (c *Collector) checkRobots(u *url.URL) error {
 	if !uaGroup.Test(eu) {
 		return ErrRobotsTxtBlocked
 	}
+	if uaGroup.CrawlDelay > 0 {
+		c.waitCrawlDelay(entry, uaGroup.CrawlDelay)
+	}
 	return nil
+}
+
+// getRobots returns the cached rules of entry, fetching them synchronously
+// when the host is seen for the first time and scheduling a background
+// refresh when they expire.
+func (c *Collector) getRobots(entry *robotsCacheEntry, scheme, host string) *robotstxt.RobotsData {
+	entry.mu.Lock()
+	if entry.robots != nil {
+		if !time.Now().Before(entry.nextRefresh) && !entry.refreshing {
+			// Rules are stale: keep serving them while they are refreshed
+			// in the background so a slow or broken host does not stall
+			// in-flight requests.
+			entry.refreshing = true
+			go c.refreshRobots(entry, scheme, host)
+		}
+		robot := entry.robots
+		entry.mu.Unlock()
+		return robot
+	}
+	entry.mu.Unlock()
+
+	// First use of this host: fetch synchronously so the very first URL is
+	// checked against the current rules. The fetch is serialized per host so
+	// concurrent first requests don't each download robots.txt.
+	entry.fetchLock.Lock()
+	defer entry.fetchLock.Unlock()
+
+	entry.mu.Lock()
+	if entry.robots != nil {
+		// Another goroutine populated the entry while we waited.
+		robot := entry.robots
+		entry.mu.Unlock()
+		return robot
+	}
+	entry.mu.Unlock()
+
+	robot, err := c.fetchRobots(scheme, host)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	c.updateRobotsEntry(entry, robot, err, time.Now())
+	return entry.robots
+}
+
+// refreshRobots reloads the rules of a stale entry in the background.
+func (c *Collector) refreshRobots(entry *robotsCacheEntry, scheme, host string) {
+	robot, err := c.fetchRobots(scheme, host)
+
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	// A failed refresh keeps the last known rules; it is recorded as a
+	// failure so the host is retried with a backoff instead of on every
+	// request.
+	c.updateRobotsEntry(entry, robot, err, time.Now())
+	entry.refreshing = false
+}
+
+// robotsEntry returns the cache entry of host, creating it if necessary.
+func (c *Collector) robotsEntry(host string) *robotsCacheEntry {
+	c.robotsLock.Lock()
+	defer c.robotsLock.Unlock()
+	entry, ok := c.robotsMap[host]
+	if !ok {
+		entry = &robotsCacheEntry{}
+		c.robotsMap[host] = entry
+	}
+	return entry
+}
+
+// updateRobotsEntry stores the outcome of a robots.txt fetch in entry.
+//
+// A successful fetch is cached for robotsCacheTTL. A failed fetch is treated
+// as "allow all" when no rules were known yet, increments the failure counter
+// and schedules the next attempt with an exponential backoff. When rules are
+// already cached, a failed refresh keeps them in place.
+//
+// entry.mu must be held by the caller.
+func (c *Collector) updateRobotsEntry(entry *robotsCacheEntry, robots *robotstxt.RobotsData, err error, now time.Time) {
+	if err == nil && robots != nil {
+		entry.failures = 0
+		entry.robots = robots
+		entry.nextRefresh = now.Add(c.robotsCacheDuration())
+		return
+	}
+
+	entry.failures++
+	if entry.robots == nil {
+		// Fail open: no rules means no restrictions.
+		entry.robots = allowAllRobots()
+	}
+	entry.nextRefresh = now.Add(robotsFailureBackoff(entry.failures))
+}
+
+// robotsCacheDuration returns how long fetched robots.txt rules stay fresh.
+func (c *Collector) robotsCacheDuration() time.Duration {
+	if c.robotsTTL > 0 {
+		return c.robotsTTL
+	}
+	return robotsCacheTTL
+}
+
+// allowAllRobots returns a robots.txt data set that allows every path.
+func allowAllRobots() *robotstxt.RobotsData {
+	data, _ := robotstxt.FromStatusAndString(http.StatusNotFound, "")
+	return data
+}
+
+// robotsFailureBackoff returns the delay before retrying a failed robots.txt
+// fetch. It grows exponentially with the number of consecutive failures so
+// unreachable hosts are not retried on every request.
+func robotsFailureBackoff(failures int) time.Duration {
+	backoff := robotsFailureRetryMin
+	for i := 1; i < failures; i++ {
+		backoff *= 2
+		if backoff >= robotsFailureRetryMax {
+			return robotsFailureRetryMax
+		}
+	}
+	return backoff
+}
+
+// waitCrawlDelay blocks until at least delay has passed since the previous
+// request to the same host, implementing robots.txt Crawl-delay as a minimum
+// interval between requests.
+func (c *Collector) waitCrawlDelay(entry *robotsCacheEntry, delay time.Duration) {
+	entry.delayMu.Lock()
+	defer entry.delayMu.Unlock()
+	if wait := time.Until(entry.lastRequest.Add(delay)); wait > 0 {
+		time.Sleep(wait)
+	}
+	entry.lastRequest = time.Now()
+}
+
+// fetchRobots downloads and parses the robots.txt file of the given host.
+func (c *Collector) fetchRobots(scheme, host string) (*robotstxt.RobotsData, error) {
+	req, err := http.NewRequest("GET", scheme+"://"+host+"/robots.txt", nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.Context != nil {
+		req = req.WithContext(c.Context)
+	}
+	hdr := http.Header{}
+	if c.Headers != nil {
+		for k, v := range *c.Headers {
+			for _, value := range v {
+				hdr.Add(k, value)
+			}
+		}
+	}
+	if _, ok := hdr["User-Agent"]; !ok {
+		hdr.Set("User-Agent", c.UserAgent)
+	}
+	req.Header = hdr
+	// The Go HTTP API ignores "Host" in the headers, preferring the client
+	// to use the Host field on Request.
+	if hostHeader := hdr.Get("Host"); hostHeader != "" {
+		req.Host = hostHeader
+	}
+
+	resp, err := c.backend.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 500 {
+		// Treat a server error like any other failed fetch: fail open and
+		// retry later instead of blocking the batch on one broken host.
+		return nil, fmt.Errorf("robots.txt request failed with status %d", resp.StatusCode)
+	}
+	return robotstxt.FromResponse(resp)
 }
 
 // String is the text representation of the collector.
@@ -1471,6 +1641,8 @@ func (c *Collector) Clone() *Collector {
 		requestCallbacks:       make([]RequestCallback, 0, 8),
 		responseCallbacks:      make([]ResponseCallback, 0, 8),
 		robotsMap:              c.robotsMap,
+		robotsLock:             c.robotsLock,
+		robotsTTL:              c.robotsTTL,
 		wg:                     &sync.WaitGroup{},
 	}
 }
