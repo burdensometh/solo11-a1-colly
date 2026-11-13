@@ -124,7 +124,7 @@ type Collector struct {
 	// Set it to 0 for infinite requests (default).
 	MaxRequests uint32
 
-	store                    storage.Storage
+	store                    *concurrentStorage
 	debugger                 debug.Debugger
 	robotsMap                map[string]*robotstxt.RobotsData
 	htmlCallbacks            []*htmlCallbackContainer
@@ -202,8 +202,7 @@ type xmlCallbackContainer struct {
 }
 
 type cookieJarSerializer struct {
-	store storage.Storage
-	lock  *sync.RWMutex
+	store *concurrentStorage
 }
 
 var collectorCounter uint32
@@ -502,7 +501,7 @@ func (c *Collector) Init() {
 	c.Headers = nil
 	c.MaxDepth = 0
 	c.MaxRequests = 0
-	c.store = &storage.InMemoryStorage{}
+	c.store = newConcurrentStorage(&storage.InMemoryStorage{})
 	c.store.Init()
 	c.MaxBodySize = 10 * 1024 * 1024
 	c.backend = &httpBackend{}
@@ -813,14 +812,17 @@ func (c *Collector) requestCheck(parsedURL *url.URL, method string, getBody func
 			defer body.Close()
 		}
 		uHash := requestHash(u, body)
-		visited, err := c.store.IsVisited(uHash)
+		// The check and the update must be one atomic operation, otherwise
+		// two concurrent collectors observing the same URL can both decide
+		// that it is unvisited and fetch it twice.
+		visited, err := c.store.checkAndVisit(uHash)
 		if err != nil {
 			return err
 		}
 		if visited {
 			return &AlreadyVisitedError{parsedURL}
 		}
-		return c.store.Visited(uHash)
+		return nil
 	}
 	return nil
 }
@@ -1093,13 +1095,20 @@ func (c *Collector) SetRequestTimeout(timeout time.Duration) {
 }
 
 // SetStorage overrides the default in-memory storage.
-// Storage stores scraping related data like cookies and visited urls
+// Storage stores scraping related data like cookies and visited urls.
+// The backend does not need to be goroutine-safe: the Collector wraps it in
+// a concurrency-safe layer, which also makes the visited check and update
+// atomic.
 func (c *Collector) SetStorage(s storage.Storage) error {
-	if err := s.Init(); err != nil {
-		return err
+	guarded, ok := s.(*concurrentStorage)
+	if !ok {
+		guarded = newConcurrentStorage(s)
+		if err := guarded.Init(); err != nil {
+			return err
+		}
 	}
-	c.store = s
-	c.backend.Client.Jar = createJar(s)
+	c.store = guarded
+	c.backend.Client.Jar = createJar(guarded)
 	return nil
 }
 
@@ -1511,7 +1520,10 @@ func (c *Collector) checkRedirectFunc() func(req *http.Request, via []*http.Requ
 				defer body.Close()
 			}
 			uHash := requestHash(req.URL.String(), body)
-			visited, err := c.store.IsVisited(uHash)
+			// Checking the redirect destination and recording it must be
+			// atomic: concurrent redirect chains that land on the same URL
+			// would otherwise all pass the check and mark it afterwards.
+			visited, err := c.store.checkAndVisit(uHash)
 			if err != nil {
 				return err
 			}
@@ -1519,10 +1531,6 @@ func (c *Collector) checkRedirectFunc() func(req *http.Request, via []*http.Requ
 				if checkRevisit, ok := req.Context().Value(CheckRevisitKey).(bool); !ok || checkRevisit {
 					return &AlreadyVisitedError{req.URL}
 				}
-			}
-			err = c.store.Visited(uHash)
-			if err != nil {
-				return err
 			}
 		}
 
@@ -1645,25 +1653,26 @@ func isYesString(s string) bool {
 	return false
 }
 
-func createJar(s storage.Storage) http.CookieJar {
-	return &cookieJarSerializer{store: s, lock: &sync.RWMutex{}}
+func createJar(s *concurrentStorage) http.CookieJar {
+	return &cookieJarSerializer{store: s}
 }
 
 func (j *cookieJarSerializer) SetCookies(u *url.URL, cookies []*http.Cookie) {
-	j.lock.Lock()
-	defer j.lock.Unlock()
-	cookieStr := j.store.Cookies(u)
-
-	// Merge existing cookies, new cookies have precedence.
-	cnew := make([]*http.Cookie, len(cookies))
-	copy(cnew, cookies)
-	existing := storage.UnstringifyCookies(cookieStr)
-	for _, c := range existing {
-		if !storage.ContainsCookie(cnew, c.Name) {
-			cnew = append(cnew, c)
+	// The read-modify-write is performed by the storage guard, which holds
+	// the per-host lock for the whole cycle so concurrent writers cannot
+	// drop each other's cookies.
+	j.store.updateCookies(u, func(cookieStr string) string {
+		// Merge existing cookies, new cookies have precedence.
+		cnew := make([]*http.Cookie, len(cookies))
+		copy(cnew, cookies)
+		existing := storage.UnstringifyCookies(cookieStr)
+		for _, c := range existing {
+			if !storage.ContainsCookie(cnew, c.Name) {
+				cnew = append(cnew, c)
+			}
 		}
-	}
-	j.store.SetCookies(u, storage.StringifyCookies(cnew))
+		return storage.StringifyCookies(cnew)
+	})
 }
 
 func (j *cookieJarSerializer) Cookies(u *url.URL) []*http.Cookie {

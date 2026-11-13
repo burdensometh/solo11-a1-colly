@@ -2352,3 +2352,159 @@ func TestEscapeMultipartFieldNamePreservesInvalidUTF8(t *testing.T) {
 		t.Errorf("escapeMultipartFieldName replaced invalid UTF-8 with U+FFFD: %q", escaped)
 	}
 }
+
+// plainMapStorage is a storage.Storage backend that is deliberately *not*
+// goroutine-safe: it is backed by a plain map without any locking. It is the
+// kind of custom backend that used to panic with "concurrent map writes" and
+// that the concurrency guard must protect.
+type plainMapStorage struct {
+	visited map[uint64]bool
+	cookies map[string]string
+}
+
+func newPlainMapStorage() *plainMapStorage {
+	return &plainMapStorage{
+		visited: make(map[uint64]bool),
+		cookies: make(map[string]string),
+	}
+}
+
+func (s *plainMapStorage) Init() error { return nil }
+
+func (s *plainMapStorage) Visited(requestID uint64) error {
+	s.visited[requestID] = true
+	return nil
+}
+
+func (s *plainMapStorage) IsVisited(requestID uint64) (bool, error) {
+	return s.visited[requestID], nil
+}
+
+func (s *plainMapStorage) Cookies(u *url.URL) string {
+	return s.cookies[u.Host]
+}
+
+func (s *plainMapStorage) SetCookies(u *url.URL, cookies string) {
+	s.cookies[u.Host] = cookies
+}
+
+// TestStorageCustomBackendConcurrentAccess exercises a custom backend from
+// many goroutines at once. A backend that is not goroutine-safe must not
+// panic, and a shared URL must be fetched exactly once even though several
+// goroutines try to visit it at the same time.
+func TestStorageCustomBackendConcurrentAccess(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Write(serverIndexResponse)
+	}))
+	defer srv.Close()
+
+	c := NewCollector(Async(true), IgnoreRobotsTxt())
+	if err := c.SetStorage(newPlainMapStorage()); err != nil {
+		t.Fatalf("SetStorage: %v", err)
+	}
+	c.OnResponse(func(r *Response) {
+		// Touching the cookie jar from many goroutines makes the race
+		// detector check the cookie path too.
+		_ = c.Cookies(r.Request.URL.String())
+	})
+
+	const goroutines = 64
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(i int) {
+			defer wg.Done()
+			// Half of the goroutines race on the same URL, the other half
+			// use distinct URLs so the visited and cookie maps are written
+			// concurrently for different keys as well.
+			u := srv.URL + "/same"
+			if i%2 == 1 {
+				u = fmt.Sprintf("%s/dir/%d?q=%d", srv.URL, i, i%7)
+			}
+			_ = c.Visit(u)
+			// Concurrent cookie writes for one host must not lose updates.
+			_ = c.SetCookies(srv.URL+"/", []*http.Cookie{{
+				Name:  fmt.Sprintf("cookie%d", i),
+				Value: "value",
+			}})
+		}(i)
+	}
+	wg.Wait()
+	c.Wait()
+
+	if got := hits.Load(); got != goroutines/2+1 {
+		// One fetch of /same and one fetch for each distinct URL.
+		t.Errorf("server got %d requests, want %d (duplicate fetch of a shared URL?)",
+			got, goroutines/2+1)
+	}
+
+	// Every cookie written concurrently must still be present.
+	got := len(c.Cookies(srv.URL + "/"))
+	if got != goroutines {
+		t.Errorf("got %d cookies, want %d (concurrent writes lost updates)", got, goroutines)
+	}
+}
+
+// TestStorageVisitedCheckAndSetIsAtomic verifies the paired check-and-set at
+// the storage level: concurrent callers must observe exactly one winner.
+func TestStorageVisitedCheckAndSetIsAtomic(t *testing.T) {
+	s := newConcurrentStorage(newPlainMapStorage())
+	const goroutines = 100
+	var winners atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			visited, err := s.checkAndVisit(42)
+			if err != nil {
+				t.Errorf("checkAndVisit: %v", err)
+				return
+			}
+			if !visited {
+				winners.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := winners.Load(); got != 1 {
+		t.Errorf("got %d callers that saw the ID as unvisited, want 1", got)
+	}
+}
+
+// TestStorageCookieLockSharding checks that the cookie lock is derived from
+// the URL host and is stable, and that it does not collapse every host onto a
+// single shard.
+func TestStorageCookieLockSharding(t *testing.T) {
+	s := newConcurrentStorage(newPlainMapStorage())
+	parse := func(raw string) *url.URL {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+
+	// Scheme and port must not change the lock: cookies are keyed by host.
+	httpURL := parse("http://cookies.example.com/a")
+	httpsURL := parse("https://cookies.example.com:8443/b")
+	if s.cookieLock(httpURL) != s.cookieLock(httpsURL) {
+		t.Error("cookie lock differs for the same host with another scheme/port")
+	}
+
+	// Different hosts must be spread over multiple shards.
+	seen := map[*sync.RWMutex]bool{s.cookieLock(httpURL): true}
+	for i := 0; i < 100; i++ {
+		seen[s.cookieLock(parse(fmt.Sprintf("https://host%d.example.com/", i)))] = true
+	}
+	if len(seen) < 2 {
+		t.Error("all hosts map to the same cookie lock")
+	}
+
+	// A nil URL must not panic; it is routed to the first shard.
+	if s.cookieLock(nil) != &s.cookieLocks[0] {
+		t.Error("nil URL did not map to the first lock shard")
+	}
+}

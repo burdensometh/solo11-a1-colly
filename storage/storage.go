@@ -27,6 +27,11 @@ import (
 // The default Storage of the Collector is the InMemoryStorage.
 // Collector's storage can be changed by calling Collector.SetStorage()
 // function.
+//
+// Implementations do not have to be goroutine-safe: the Collector serializes
+// all access to the backend. Visited and IsVisited must behave as a pair,
+// however; the Collector performs the check-and-set atomically so a request
+// is only reported as unvisited to one caller.
 type Storage interface {
 	// Init initializes the storage
 	Init() error
