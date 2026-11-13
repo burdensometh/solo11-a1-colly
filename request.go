@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	whatwgUrl "github.com/nlnwa/whatwg-url/url"
 )
 
 // Request is the representation of a HTTP request made by a Collector
@@ -63,13 +65,21 @@ type serializableRequest struct {
 	Host    string
 }
 
-// New creates a new request with the context of the original request
+// New creates a new request with the context of the original request.
+// Relative URLs are resolved against the current document's base URL and
+// the resulting URL is normalized the same way Collector requests are.
 func (r *Request) New(method, URL string, body io.Reader) (*Request, error) {
-	u, err := urlParser.Parse(URL)
+	var u *whatwgUrl.Url
+	var err error
+	if base := r.baseURLString(); base != "" {
+		u, err = urlParser.ParseRef(base, URL)
+	} else {
+		u, err = urlParser.Parse(URL)
+	}
 	if err != nil {
 		return nil, err
 	}
-	u2, err := url.Parse(u.Href(false))
+	u2, err := url.Parse(normalizeParsedURL(u))
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +93,18 @@ func (r *Request) New(method, URL string, body io.Reader) (*Request, error) {
 		ID:        r.collector.requestCount.Add(1),
 		collector: r.collector,
 	}, nil
+}
+
+// baseURLString returns the absolute URL that relative references in URL
+// should be resolved against.
+func (r *Request) baseURLString() string {
+	if r.baseURL != nil {
+		return r.baseURL.String()
+	}
+	if r.URL != nil {
+		return r.URL.String()
+	}
+	return ""
 }
 
 // Abort cancels the HTTP request when called in an OnRequest callback
@@ -185,7 +207,9 @@ func (r *Request) Marshal() ([]byte, error) {
 		}
 	}
 	sr := &serializableRequest{
-		URL:    r.URL.String(),
+		// Store the canonical URL so requests deduplicate identically
+		// when they are replayed from a queue.
+		URL:    normalizeURL(r.URL.String()),
 		Host:   r.Host,
 		Method: r.Method,
 		Depth:  r.Depth,

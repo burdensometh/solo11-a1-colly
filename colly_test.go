@@ -2352,3 +2352,197 @@ func TestEscapeMultipartFieldNamePreservesInvalidUTF8(t *testing.T) {
 		t.Errorf("escapeMultipartFieldName replaced invalid UTF-8 with U+FFFD: %q", escaped)
 	}
 }
+
+func TestNormalizeURL(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		// Fragments never reach the server, so they are dropped.
+		{"http://example.com/page#section", "http://example.com/page"},
+		{"http://example.com/page#", "http://example.com/page"},
+		// Hosts are case-insensitive.
+		{"HTTP://Example.COM/Path", "http://example.com/Path"},
+		{"http://User:Pass@Example.COM:8080/page", "http://User:Pass@example.com:8080/page"},
+		// Duplicate slashes in the path are collapsed.
+		{"http://example.com//a///b//", "http://example.com/a/b/"},
+		{"http://example.com//", "http://example.com/"},
+		// The empty path becomes "/".
+		{"http://example.com", "http://example.com/"},
+		// Paths keep their case, escapes and meaningful single slashes.
+		{"http://example.com/Path/%2F/x%2fy", "http://example.com/Path/%2F/x%2fy"},
+		{"http://example.com/100%25", "http://example.com/100%25"},
+		// The query is left untouched, including any "//".
+		{"http://example.com/a?x=//&y=#f", "http://example.com/a?x=//&y="},
+		// Opaque paths are not slash-separated and must not be rewritten.
+		{"mailto:a//b#c", "mailto:a//b"},
+		// IPv6 literals stay as they are.
+		{"http://[::1]:8080//a", "http://[::1]:8080/a"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := normalizeURL(tt.in); got != tt.want {
+				t.Errorf("normalizeURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeURLIdempotent(t *testing.T) {
+	for _, u := range []string{
+		"HTTP://Example.COM//a///b#frag",
+		"http://example.com/%2F//x",
+		"mailto:a//b#c",
+		"http://user:pass@example.com:8080/a?b=//#f",
+	} {
+		once := normalizeURL(u)
+		if twice := normalizeURL(once); twice != once {
+			t.Errorf("normalizeURL not idempotent for %q: %q -> %q", u, once, twice)
+		}
+	}
+}
+
+func TestRequestHashIgnoresNormalizedVariants(t *testing.T) {
+	same := [][]string{
+		{"http://example.com/a/b", "http://example.com/a/b#frag"},
+		{"http://example.com/a/b", "HTTP://Example.COM/a/b"},
+		{"http://example.com/a/b", "http://example.com//a///b"},
+	}
+	for _, group := range same {
+		want := requestHash(group[0], nil)
+		for _, u := range group[1:] {
+			if got := requestHash(u, nil); got != want {
+				t.Errorf("requestHash(%q) = %d, want %d (same as %q)", u, got, want, group[0])
+			}
+		}
+	}
+	// Distinct requests must not collide.
+	if requestHash("http://example.com/a", nil) == requestHash("http://example.com/b", nil) {
+		t.Error("different URLs hashed identically")
+	}
+	// The body is still part of the request identity.
+	if requestHash("http://example.com/a", strings.NewReader("x")) == requestHash("http://example.com/a", strings.NewReader("y")) {
+		t.Error("different bodies hashed identically")
+	}
+}
+
+func TestCollectorDeduplicatesURLVariants(t *testing.T) {
+	var requested []string
+	var mu sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requested = append(requested, r.URL.RequestURI())
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<a href="#frag">frag</a><a href="/page">page</a>`))
+	}))
+	defer ts.Close()
+
+	c := NewCollector()
+	if err := c.Visit(ts.URL + "/page"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, variant := range []string{
+		ts.URL + "/page#again",
+		ts.URL + "//page",
+		ts.URL + "/./page",
+	} {
+		var ave *AlreadyVisitedError
+		if err := c.Visit(variant); !errors.As(err, &ave) {
+			t.Errorf("Visit(%q) err = %v, want AlreadyVisitedError", variant, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requested) != 1 {
+		t.Fatalf("server got %d requests (%v), want 1", len(requested), requested)
+	}
+	if requested[0] != "/page" {
+		t.Errorf("requested path = %q, want /page", requested[0])
+	}
+}
+
+func TestCollectorNormalizesRelativeURLs(t *testing.T) {
+	var requested []string
+	var mu sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requested = append(requested, r.URL.RequestURI())
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/html")
+		if r.URL.Path != "/index.html" {
+			w.Write([]byte(`<!DOCTYPE html><html><body>leaf</body></html>`))
+			return
+		}
+		w.Write([]byte(`<!DOCTYPE html><html><head><base href="/docs/"></head><body>
+<a href="guide">guide</a>
+</body></html>`))
+	}))
+	defer ts.Close()
+
+	c := NewCollector()
+	c.OnHTML("a[href]", func(e *HTMLElement) {
+		if err := e.Request.Visit(e.Attr("href")); err != nil {
+			t.Errorf("visit failed: %v", err)
+		}
+		// The relative reference must be reported absolute.
+		if got, want := e.Request.AbsoluteURL(e.Attr("href")), ts.URL+"/docs/guide"; got != want {
+			t.Errorf("AbsoluteURL = %q, want %q", got, want)
+		}
+	})
+	if err := c.Visit(ts.URL + "/index.html"); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"/index.html", "/docs/guide"}; !reflect.DeepEqual(requested, want) {
+		t.Errorf("requested = %v, want %v", requested, want)
+	}
+}
+
+func TestCollectorDebugLogsURLNormalization(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	d := &recordingDebugger{}
+	c := NewCollector(Debugger(d))
+	if err := c.Visit(ts.URL + "//page#frag"); err != nil {
+		t.Fatal(err)
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var found bool
+	for _, e := range d.events {
+		if e.Type != "urlNormalize" {
+			continue
+		}
+		found = true
+		if got, want := e.Values["original"], ts.URL+"//page#frag"; got != want {
+			t.Errorf("original = %q, want %q", got, want)
+		}
+		if got, want := e.Values["normalized"], ts.URL+"/page"; got != want {
+			t.Errorf("normalized = %q, want %q", got, want)
+		}
+	}
+	if !found {
+		t.Error("no urlNormalize debug event emitted")
+	}
+}
+
+// recordingDebugger captures events for assertions.
+type recordingDebugger struct {
+	mu     sync.Mutex
+	events []*debug.Event
+}
+
+func (d *recordingDebugger) Init() error { return nil }
+
+func (d *recordingDebugger) Event(e *debug.Event) {
+	d.mu.Lock()
+	d.events = append(d.events, e)
+	d.mu.Unlock()
+}

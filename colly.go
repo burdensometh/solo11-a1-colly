@@ -646,7 +646,12 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 	if err != nil {
 		return err
 	}
-	parsedURL, err := url.Parse(parsedWhatwgURL.Href(false))
+	// Canonicalize the URL before it is enqueued or checked against the
+	// visited store, so that variants of the same page (fragment, host
+	// case, duplicate slashes) are deduplicated as one request.
+	normalized := normalizeParsedURL(parsedWhatwgURL)
+	c.debugURLNormalized(u, normalized)
+	parsedURL, err := url.Parse(normalized)
 	if err != nil {
 		return err
 	}
@@ -684,10 +689,13 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 	// replace this with http.NewRequestWithContext
 	req = req.WithContext(context.WithValue(c.Context, CheckRevisitKey, checkRevisit))
 
-	if err := c.requestCheck(parsedURL, method, req.GetBody, depth, checkRevisit); err != nil {
+	// The parsed URL only differs from the canonical string in the way
+	// net/url serializes it, but keep the canonical form as the single
+	// source of truth for de-duplication.
+	u = normalized
+	if err := c.requestCheck(parsedURL, normalized, method, req.GetBody, depth, checkRevisit); err != nil {
 		return err
 	}
-	u = parsedURL.String()
 	c.wg.Add(1)
 	if c.Async {
 		go c.fetch(u, method, depth, requestData, ctx, hdr, req)
@@ -779,8 +787,8 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 	return err
 }
 
-func (c *Collector) requestCheck(parsedURL *url.URL, method string, getBody func() (io.ReadCloser, error), depth int, checkRevisit bool) error {
-	u := parsedURL.String()
+func (c *Collector) requestCheck(parsedURL *url.URL, normalizedURL, method string, getBody func() (io.ReadCloser, error), depth int, checkRevisit bool) error {
+	u := normalizedURL
 	if c.MaxDepth > 0 && c.MaxDepth < depth {
 		return ErrMaxDepth
 	}
@@ -812,7 +820,7 @@ func (c *Collector) requestCheck(parsedURL *url.URL, method string, getBody func
 			}
 			defer body.Close()
 		}
-		uHash := requestHash(u, body)
+		uHash := requestHashNormalized(u, body)
 		visited, err := c.store.IsVisited(uHash)
 		if err != nil {
 			return err
@@ -1510,7 +1518,7 @@ func (c *Collector) checkRedirectFunc() func(req *http.Request, via []*http.Requ
 				}
 				defer body.Close()
 			}
-			uHash := requestHash(req.URL.String(), body)
+			uHash := requestHashNormalized(normalizedURL, body)
 			visited, err := c.store.IsVisited(uHash)
 			if err != nil {
 				return err
@@ -1694,19 +1702,87 @@ func isMatchingFilter(fs []*regexp.Regexp, d []byte) bool {
 	return false
 }
 
+// normalizeParsedURL rewrites parsed in place to its canonical form and
+// returns its serialization. The canonical form has no fragment, a
+// lowercased host and no duplicate slashes in the path. The query string
+// is left untouched because its meaning is up to the server.
+func normalizeParsedURL(parsed *whatwgUrl.Url) string {
+	// The fragment identifies a position inside the document, not a
+	// different document, so it must not affect request de-duplication.
+	parsed.SetHash("")
+
+	// The WHATWG parser already lowercases the host of special URLs,
+	// but keep this explicit for the non-special schemes it leaves as-is.
+	if host := parsed.Hostname(); host != "" && !parsed.IsIPv6() {
+		if lower := strings.ToLower(host); lower != host {
+			parsed.SetHostname(lower)
+		}
+	}
+
+	// Collapse duplicate slashes in the path ("/a//b" -> "/a/b").
+	// Escaped slashes (%2F) are part of a path segment, not separators,
+	// and must stay as they are.
+	if !parsed.OpaquePath() {
+		if path := parsed.Pathname(); strings.Contains(path, "//") {
+			parsed.SetPathname(collapsePathSlashes(path))
+		}
+	}
+
+	return parsed.Href(false)
+}
+
+// collapsePathSlashes replaces every run of two or more slashes in path
+// with a single slash.
+func collapsePathSlashes(path string) string {
+	var b strings.Builder
+	b.Grow(len(path))
+	prevSlash := false
+	for i := 0; i < len(path); i++ {
+		if path[i] == '/' {
+			if prevSlash {
+				continue
+			}
+			prevSlash = true
+		} else {
+			prevSlash = false
+		}
+		b.WriteByte(path[i])
+	}
+	return b.String()
+}
+
 func normalizeURL(u string) string {
 	parsed, err := urlParser.Parse(u)
 	if err != nil {
 		return u
 	}
-	return parsed.String()
+	return normalizeParsedURL(parsed)
+}
+
+// debugURLNormalized reports a URL rewrite to the collector's debugger.
+// It is a no-op when no debugger is attached or the URL was unchanged.
+func (c *Collector) debugURLNormalized(original, normalized string) {
+	if c == nil || c.debugger == nil || original == normalized {
+		return
+	}
+	c.debugger.Event(createEvent("urlNormalize", 0, c.ID, map[string]string{
+		"original":   original,
+		"normalized": normalized,
+	}))
 }
 
 func requestHash(url string, body io.Reader) uint64 {
-	h := fnv.New64a()
 	// reparse the url to fix ambiguities such as
-	// "http://example.com" vs "http://example.com/"
-	io.WriteString(h, normalizeURL(url))
+	// "http://example.com" vs "http://example.com/", and to make
+	// fragment-only and duplicate-slash variants hash identically
+	return requestHashNormalized(normalizeURL(url), body)
+}
+
+// requestHashNormalized hashes an already normalized URL string, optionally
+// followed by the request body.
+func requestHashNormalized(url string, body io.Reader) uint64 {
+	h := fnv.New64a()
+	io.WriteString(h, url)
 	if body != nil {
 		io.Copy(h, body)
 	}
