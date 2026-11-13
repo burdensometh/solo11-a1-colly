@@ -25,6 +25,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -123,6 +124,17 @@ type Collector struct {
 	// MaxRequests limit the number of requests done by the instance.
 	// Set it to 0 for infinite requests (default).
 	MaxRequests uint32
+	// MaxRetries is the maximum number of automatic retries of a failed
+	// request. Only GET and HEAD requests are retried automatically; other
+	// methods are left untouched. Set it to 0 to disable automatic retries.
+	// The default value is 3.
+	MaxRetries int
+	// RetryBackoff is the sequence of delays between automatic retry attempts.
+	// The n-th retry waits RetryBackoff[n-1]. If the sequence is shorter than
+	// MaxRetries, the last element is reused. If the sequence is empty,
+	// retries are performed without delay.
+	// The default sequence is 1s, 5s, 30s.
+	RetryBackoff []time.Duration
 
 	store                    storage.Storage
 	debugger                 debug.Debugger
@@ -134,6 +146,7 @@ type Collector struct {
 	responseHeadersCallbacks []ResponseHeadersCallback
 	requestHeadersCallbacks  []RequestCallback
 	errorCallbacks           []ErrorCallback
+	retryCallbacks           []RetryCallback
 	scrapedCallbacks         []ScrapedCallback
 	requestCount             atomic.Uint32
 	responseCount            atomic.Uint32
@@ -162,6 +175,9 @@ type XMLCallback func(*XMLElement)
 
 // ErrorCallback is a type alias for OnError callback functions
 type ErrorCallback func(*Response, error)
+
+// RetryCallback is a type alias for OnRetry callback functions
+type RetryCallback func(*Response, error, int)
 
 // ScrapedCallback is a type alias for OnScraped callback functions
 type ScrapedCallback func(*Response)
@@ -300,6 +316,12 @@ var envMap = map[string]func(*Collector, string){
 			c.MaxRequests = uint32(maxRequests)
 		}
 	},
+	"MAX_RETRIES": func(c *Collector, val string) {
+		maxRetries, err := strconv.Atoi(val)
+		if err == nil {
+			c.MaxRetries = maxRetries
+		}
+	},
 	"PARSE_HTTP_ERROR_RESPONSE": func(c *Collector, val string) {
 		c.ParseHTTPErrorResponse = isYesString(val)
 	},
@@ -357,6 +379,25 @@ func MaxDepth(depth int) CollectorOption {
 func MaxRequests(max uint32) CollectorOption {
 	return func(c *Collector) {
 		c.MaxRequests = max
+	}
+}
+
+// MaxRetries sets the maximum number of automatic retries of a failed
+// request. Only GET and HEAD requests are retried automatically.
+// Set it to 0 to disable automatic retries. The default is 3.
+func MaxRetries(max int) CollectorOption {
+	return func(c *Collector) {
+		c.MaxRetries = max
+	}
+}
+
+// RetryBackoff sets the delays between automatic retry attempts.
+// The n-th retry waits backoff[n-1]. If the sequence is shorter than
+// MaxRetries, the last element is reused. An empty sequence retries
+// without delay. The default sequence is 1s, 5s, 30s.
+func RetryBackoff(backoff ...time.Duration) CollectorOption {
+	return func(c *Collector) {
+		c.RetryBackoff = backoff
 	}
 }
 
@@ -502,6 +543,8 @@ func (c *Collector) Init() {
 	c.Headers = nil
 	c.MaxDepth = 0
 	c.MaxRequests = 0
+	c.MaxRetries = 3
+	c.RetryBackoff = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second}
 	c.store = &storage.InMemoryStorage{}
 	c.store.Init()
 	c.MaxBodySize = 10 * 1024 * 1024
@@ -727,12 +770,8 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	}
 
-	var hTrace *HTTPTrace
-	if c.TraceHTTP {
-		hTrace = &HTTPTrace{}
-		req = hTrace.WithTrace(req)
-	}
 	origURL := req.URL
+	baseReq := req
 	checkResponseHeadersFunc := func(req *http.Request, statusCode int, headers http.Header) bool {
 		if req.URL != origURL {
 			request.URL = req.URL
@@ -745,10 +784,56 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 		c.handleOnRequestHeaders(request)
 		return !request.abort
 	}
-	response, err := c.backend.Cache(req, c.MaxBodySize, checkRequestHeadersFunc, checkResponseHeadersFunc, c.CacheDir, c.CacheExpiration)
-	if proxyURL, ok := req.Context().Value(ProxyURLKey).(string); ok {
-		request.ProxyURL = proxyURL
+
+	// Only idempotent requests (GET/HEAD) are retried automatically, and only
+	// when the request body can be replayed for every attempt.
+	attempts := 1
+	if c.MaxRetries > 0 && (method == "GET" || method == "HEAD") && c.canRetry(req) {
+		attempts += c.MaxRetries
 	}
+
+	var hTrace *HTTPTrace
+	var response *Response
+	var err error
+	for attempt := 1; ; attempt++ {
+		attemptReq := baseReq
+		hTrace = nil
+		if c.TraceHTTP {
+			hTrace = &HTTPTrace{}
+			attemptReq = hTrace.WithTrace(attemptReq)
+		}
+
+		response, err = c.backend.Cache(attemptReq, c.MaxBodySize, checkRequestHeadersFunc, checkResponseHeadersFunc, c.CacheDir, c.CacheExpiration)
+		if proxyURL, ok := attemptReq.Context().Value(ProxyURLKey).(string); ok {
+			request.ProxyURL = proxyURL
+		}
+
+		if err == nil || request.abort || attempt >= attempts || !c.isRetryableError(err) {
+			break
+		}
+
+		retryResponse := &Response{
+			Ctx:     ctx,
+			Request: request,
+		}
+		if response != nil {
+			retryResponse.StatusCode = response.StatusCode
+			retryResponse.Headers = response.Headers
+		}
+		c.handleOnRetry(retryResponse, err, attempt)
+
+		if !c.waitBeforeRetry(attempt) {
+			break
+		}
+
+		nextReq, retryErr := c.newRetryRequest(baseReq)
+		if retryErr != nil {
+			err = retryErr
+			break
+		}
+		baseReq = nextReq
+	}
+
 	if err := c.handleOnError(response, err, request, ctx); err != nil {
 		return err
 	}
@@ -777,6 +862,124 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 	c.handleOnScraped(response)
 
 	return err
+}
+
+// canRetry reports whether the request body (if any) can be replayed.
+func (c *Collector) canRetry(req *http.Request) bool {
+	return req.Body == nil || req.GetBody != nil
+}
+
+// isRetryableError reports whether a failed request is worth retrying.
+// Only transient transport-level failures are retried: connection errors,
+// timeouts and truncated bodies. Errors caused by cancellation or by the
+// Collector's own configuration (filters, redirects, revisits, aborted
+// callbacks) cannot be fixed by repeating the request, so they are returned
+// immediately.
+func (c *Collector) isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// If the Collector's context (e.g. one set with StdlibContext) already
+	// expired, retrying would fail immediately. Checking the live context
+	// also distinguishes a caller cancellation from a request timeout: the
+	// latter is reported by net/http with an error matching
+	// context.DeadlineExceeded, but leaves the Collector's context untouched.
+	if c.Context.Err() != nil {
+		return false
+	}
+	// An AlreadyVisitedError is deterministic. Request-level retries disable
+	// revisit checks, so this only reaches here for manual Request.Retry calls.
+	var alreadyVisited *AlreadyVisitedError
+	if errors.As(err, &alreadyVisited) {
+		return false
+	}
+	// Timeouts, including Client.Timeout and body-read timeouts.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	// Unwrap net/http's *url.Error so configuration errors wrapped by it are
+	// not mistaken for transport failures.
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return isTransportError(uerr.Err)
+	}
+	return isTransportError(err)
+}
+
+// isTransportError reports whether err is a transient network failure.
+func isTransportError(err error) bool {
+	// A DNS lookup failure is transient unless the name definitively does
+	// not exist. This is checked first because net wraps DNS errors in
+	// *net.OpError, which would otherwise be accepted below.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return !dnsErr.IsNotFound
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	return false
+}
+
+// waitBeforeRetry sleeps for the delay associated with the given retry
+// number. It returns false if the Collector's context is cancelled before the
+// next attempt, in which case no further attempt should be made.
+func (c *Collector) waitBeforeRetry(retry int) bool {
+	delay := c.retryDelay(retry)
+	if err := c.Context.Err(); err != nil {
+		return false
+	}
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-c.Context.Done():
+		return false
+	}
+}
+
+// retryDelay returns the delay before the given retry attempt.
+func (c *Collector) retryDelay(retry int) time.Duration {
+	if len(c.RetryBackoff) == 0 {
+		return 0
+	}
+	i := retry - 1
+	if i >= len(c.RetryBackoff) {
+		i = len(c.RetryBackoff) - 1
+	}
+	if i < 0 {
+		i = 0
+	}
+	return c.RetryBackoff[i]
+}
+
+// newRetryRequest builds a fresh copy of req which can be sent again.
+// Cookie headers are dropped so that the cookie jar can provide the current
+// cookies instead of replaying stale ones. Revisit checks are disabled for the
+// retry: it is a replay of the same logical request, so redirect hops which
+// were already recorded as visited during the previous attempt must not turn
+// the retry into an AlreadyVisitedError.
+func (c *Collector) newRetryRequest(req *http.Request) (*http.Request, error) {
+	ctx := context.WithValue(req.Context(), CheckRevisitKey, false)
+	retryReq := req.Clone(ctx)
+	retryReq.Header.Del("Cookie")
+	if req.GetBody != nil {
+		body, err := req.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		retryReq.Body = body
+	}
+	return retryReq, nil
 }
 
 func (c *Collector) requestCheck(parsedURL *url.URL, method string, getBody func() (io.ReadCloser, error), depth int, checkRevisit bool) error {
@@ -926,13 +1129,14 @@ func (c *Collector) checkRobots(u *url.URL) error {
 // It contains useful debug information about the collector's internals
 func (c *Collector) String() string {
 	return fmt.Sprintf(
-		"Requests made: %d (%d responses) | Callbacks: OnRequest: %d, OnHTML: %d, OnResponse: %d, OnError: %d",
+		"Requests made: %d (%d responses) | Callbacks: OnRequest: %d, OnHTML: %d, OnResponse: %d, OnError: %d, OnRetry: %d",
 		c.requestCount.Load(),
 		c.responseCount.Load(),
 		len(c.requestCallbacks),
 		len(c.htmlCallbacks),
 		len(c.responseCallbacks),
 		len(c.errorCallbacks),
+		len(c.retryCallbacks),
 	)
 }
 
@@ -1053,6 +1257,24 @@ func (c *Collector) OnError(f ErrorCallback) {
 		c.errorCallbacks = make([]ErrorCallback, 0, 4)
 	}
 	c.errorCallbacks = append(c.errorCallbacks, f)
+	c.lock.Unlock()
+}
+
+// OnRetry registers a function. Function will be executed before every
+// automatic retry attempt of a request. The response may be empty (with
+// only the Request and Ctx set) when the attempt failed before a response
+// was received. The error is the reason of the retry and the int argument
+// is the number of the retry about to be performed, starting from 1.
+//
+// OnRetry is only called for automatic retries configured with MaxRetries.
+// Retries triggered manually from callbacks via Request.Retry are not
+// reported.
+func (c *Collector) OnRetry(f RetryCallback) {
+	c.lock.Lock()
+	if c.retryCallbacks == nil {
+		c.retryCallbacks = make([]RetryCallback, 0, 4)
+	}
+	c.retryCallbacks = append(c.retryCallbacks, f)
 	c.lock.Unlock()
 }
 
@@ -1333,6 +1555,19 @@ func (c *Collector) handleOnXML(resp *Response) error {
 	return nil
 }
 
+func (c *Collector) handleOnRetry(response *Response, err error, retry int) {
+	if c.debugger != nil {
+		c.debugger.Event(createEvent("retry", response.Request.ID, c.ID, map[string]string{
+			"url":   response.Request.URL.String(),
+			"error": err.Error(),
+			"retry": strconv.Itoa(retry),
+		}))
+	}
+	for _, f := range c.retryCallbacks {
+		f(response, err, retry)
+	}
+}
+
 func (c *Collector) handleOnError(response *Response, err error, request *Request, ctx *Context) error {
 	if err == nil && (c.ParseHTTPErrorResponse || response.StatusCode < 300) {
 		return nil
@@ -1450,6 +1685,8 @@ func (c *Collector) Clone() *Collector {
 		MaxBodySize:            c.MaxBodySize,
 		MaxDepth:               c.MaxDepth,
 		MaxRequests:            c.MaxRequests,
+		MaxRetries:             c.MaxRetries,
+		RetryBackoff:           c.RetryBackoff,
 		DisallowedURLFilters:   c.DisallowedURLFilters,
 		URLFilters:             c.URLFilters,
 		CheckHead:              c.CheckHead,
@@ -1464,6 +1701,7 @@ func (c *Collector) Clone() *Collector {
 		Async:                  c.Async,
 		redirectHandler:        c.redirectHandler,
 		errorCallbacks:         make([]ErrorCallback, 0, 8),
+		retryCallbacks:         make([]RetryCallback, 0, 8),
 		htmlCallbacks:          make([]*htmlCallbackContainer, 0, 8),
 		xmlCallbacks:           make([]*xmlCallbackContainer, 0, 8),
 		scrapedCallbacks:       make([]ScrapedCallback, 0, 8),

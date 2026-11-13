@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -2350,5 +2351,526 @@ func TestEscapeMultipartFieldNamePreservesInvalidUTF8(t *testing.T) {
 	// using ContainsRune, which would itself decode the invalid bytes.
 	if bytes.Contains([]byte(escaped), []byte{0xEF, 0xBF, 0xBD}) {
 		t.Errorf("escapeMultipartFieldName replaced invalid UTF-8 with U+FFFD: %q", escaped)
+	}
+}
+
+// transientErr is a network-level error which automatic retries treat as
+// recoverable.
+func transientErr() error {
+	return &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+}
+
+type retryTransport struct {
+	attempts  atomic.Int32
+	failUntil int32
+	err       error
+}
+
+func (t *retryTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	n := t.attempts.Add(1)
+	if n <= t.failUntil {
+		return nil, t.err
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("ok")),
+		Request:    r,
+	}, nil
+}
+
+type plainReader struct {
+	r io.Reader
+}
+
+func (p plainReader) Read(b []byte) (int, error) {
+	return p.r.Read(b)
+}
+
+func TestRetryDefaultConfig(t *testing.T) {
+	c := NewCollector()
+	if c.MaxRetries != 3 {
+		t.Errorf("default MaxRetries = %d, want 3", c.MaxRetries)
+	}
+	want := []time.Duration{time.Second, 5 * time.Second, 30 * time.Second}
+	if !reflect.DeepEqual(c.RetryBackoff, want) {
+		t.Errorf("default RetryBackoff = %v, want %v", c.RetryBackoff, want)
+	}
+}
+
+func TestRetrySuccessAfterTransientFailure(t *testing.T) {
+	tr := &retryTransport{
+		failUntil: 2,
+		err:       &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")},
+	}
+	c := NewCollector(MaxRetries(3), RetryBackoff(time.Millisecond, time.Millisecond, time.Millisecond))
+	c.WithTransport(tr)
+
+	var retries []int
+	var retryErrs []error
+	c.OnRetry(func(_ *Response, err error, retry int) {
+		retries = append(retries, retry)
+		retryErrs = append(retryErrs, err)
+	})
+	onErrorCalled := false
+	c.OnError(func(_ *Response, _ error) { onErrorCalled = true })
+	body := ""
+	c.OnResponse(func(r *Response) { body = string(r.Body) })
+
+	if err := c.Visit("http://retry.example/"); err != nil {
+		t.Fatalf("Visit returned error after successful retry: %v", err)
+	}
+	if got, want := tr.attempts.Load(), int32(3); got != want {
+		t.Errorf("attempts = %d, want %d", got, want)
+	}
+	if want := []int{1, 2}; !reflect.DeepEqual(retries, want) {
+		t.Errorf("OnRetry retry numbers = %v, want %v", retries, want)
+	}
+	if len(retryErrs) != 2 {
+		t.Errorf("OnRetry error count = %d, want 2", len(retryErrs))
+	}
+	for i, err := range retryErrs {
+		if err == nil {
+			t.Errorf("OnRetry #%d got nil error", i+1)
+		}
+	}
+	if onErrorCalled {
+		t.Error("OnError called although the retried request succeeded")
+	}
+	if body != "ok" {
+		t.Errorf("response body = %q, want %q", body, "ok")
+	}
+}
+
+func TestRetryExhausted(t *testing.T) {
+	tr := &retryTransport{
+		failUntil: 10,
+		err:       transientErr(),
+	}
+	c := NewCollector(MaxRetries(3), RetryBackoff(0))
+	c.WithTransport(tr)
+
+	retryCount := 0
+	c.OnRetry(func(_ *Response, _ error, retry int) {
+		retryCount++
+		if retry != retryCount {
+			t.Errorf("retry number = %d, want %d", retry, retryCount)
+		}
+	})
+	errCount := 0
+	c.OnError(func(_ *Response, _ error) { errCount++ })
+
+	_ = c.Visit("http://retry.example/")
+
+	if got, want := tr.attempts.Load(), int32(4); got != want {
+		t.Errorf("attempts = %d, want %d (1 try + 3 retries)", got, want)
+	}
+	if retryCount != 3 {
+		t.Errorf("OnRetry called %d times, want 3", retryCount)
+	}
+	if errCount != 1 {
+		t.Errorf("OnError called %d times, want 1 (only after retries are exhausted)", errCount)
+	}
+}
+
+func TestRetryDisabled(t *testing.T) {
+	tr := &retryTransport{
+		failUntil: 10,
+		err:       transientErr(),
+	}
+	c := NewCollector(MaxRetries(0))
+	c.WithTransport(tr)
+	c.OnRetry(func(_ *Response, _ error, _ int) {
+		t.Error("OnRetry called although MaxRetries is 0")
+	})
+	_ = c.Visit("http://retry.example/")
+
+	if got, want := tr.attempts.Load(), int32(1); got != want {
+		t.Errorf("attempts = %d, want %d", got, want)
+	}
+}
+
+func TestRetryOnlyIdempotentMethods(t *testing.T) {
+	for _, method := range []string{"POST", "PUT", "DELETE", "PATCH"} {
+		t.Run(method, func(t *testing.T) {
+			tr := &retryTransport{
+				failUntil: 10,
+				err:       transientErr(),
+			}
+			c := NewCollector(MaxRetries(3), RetryBackoff(0))
+			c.WithTransport(tr)
+			c.OnRetry(func(_ *Response, _ error, _ int) {
+				t.Errorf("OnRetry called for %s request", method)
+			})
+
+			_ = c.Request(method, "http://retry.example/", nil, nil, nil)
+			if got, want := tr.attempts.Load(), int32(1); got != want {
+				t.Errorf("%s attempts = %d, want %d", method, got, want)
+			}
+		})
+	}
+}
+
+func TestRetryHead(t *testing.T) {
+	tr := &retryTransport{
+		failUntil: 1,
+		err:       transientErr(),
+	}
+	c := NewCollector(MaxRetries(3), RetryBackoff(0))
+	c.WithTransport(tr)
+	retried := false
+	c.OnRetry(func(_ *Response, _ error, _ int) { retried = true })
+
+	if err := c.Head("http://retry.example/"); err != nil {
+		t.Fatalf("Head returned error after successful retry: %v", err)
+	}
+	if !retried {
+		t.Error("OnRetry was not called for HEAD request")
+	}
+	if got, want := tr.attempts.Load(), int32(2); got != want {
+		t.Errorf("attempts = %d, want %d", got, want)
+	}
+}
+
+func TestRetryBackoffSequence(t *testing.T) {
+	c := NewCollector(MaxRetries(5), RetryBackoff(10*time.Millisecond, 20*time.Millisecond))
+	if got, want := c.retryDelay(1), 10*time.Millisecond; got != want {
+		t.Errorf("retryDelay(1) = %v, want %v", got, want)
+	}
+	if got, want := c.retryDelay(2), 20*time.Millisecond; got != want {
+		t.Errorf("retryDelay(2) = %v, want %v", got, want)
+	}
+	// The last delay is reused once the sequence is exhausted.
+	if got, want := c.retryDelay(5), 20*time.Millisecond; got != want {
+		t.Errorf("retryDelay(5) = %v, want %v", got, want)
+	}
+
+	noBackoff := NewCollector(RetryBackoff())
+	if got := noBackoff.retryDelay(1); got != 0 {
+		t.Errorf("retryDelay(1) = %v, want 0 for empty backoff", got)
+	}
+}
+
+func TestRetrySkipsDeterministicErrors(t *testing.T) {
+	// A redirect/domain-filter error is not transient; retrying only wastes
+	// time and turns a clear error into a confusing "already visited" one.
+	ts := newTestServer()
+	defer ts.Close()
+
+	c := NewCollector(DisallowedDomains("evil.example"), MaxRetries(3), RetryBackoff(0))
+	retried := false
+	c.OnRetry(func(_ *Response, _ error, _ int) { retried = true })
+
+	err := c.Visit(ts.URL + "/redirect?d=http://evil.example/")
+	if !errors.Is(err, ErrForbiddenDomain) {
+		t.Errorf("Visit error = %v, want ErrForbiddenDomain", err)
+	}
+	if retried {
+		t.Error("OnRetry called for a forbidden redirect")
+	}
+}
+
+func TestRetrySkipsAlreadyVisited(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	c := NewCollector(MaxRetries(3), RetryBackoff(0))
+	c.OnRetry(func(_ *Response, _ error, _ int) {
+		t.Error("OnRetry called for AlreadyVisitedError")
+	})
+	if err := c.Visit(ts.URL); err != nil {
+		t.Fatalf("first Visit failed: %v", err)
+	}
+	err := c.Visit(ts.URL)
+	var ave *AlreadyVisitedError
+	if !errors.As(err, &ave) {
+		t.Errorf("second Visit error = %v, want AlreadyVisitedError", err)
+	}
+}
+
+func TestRetrySkipsCallerContextDeadline(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	c := NewCollector(StdlibContext(ctx), MaxRetries(3), RetryBackoff(0))
+	retried := false
+	c.OnRetry(func(_ *Response, _ error, _ int) { retried = true })
+
+	if err := c.Visit(ts.URL + "/slow"); err != context.DeadlineExceeded {
+		t.Errorf("Visit error = %#v, want context.DeadlineExceeded", err)
+	}
+	if retried {
+		t.Error("OnRetry called although the caller's context expired")
+	}
+}
+
+func TestRetryUnreplayableBodyNotRetried(t *testing.T) {
+	// A GET with a body that cannot be replayed must not be retried.
+	tr := &retryTransport{
+		failUntil: 10,
+		err:       transientErr(),
+	}
+	c := NewCollector(MaxRetries(3), RetryBackoff(0))
+	c.WithTransport(tr)
+	c.OnRetry(func(_ *Response, _ error, _ int) {
+		t.Error("OnRetry called for an unreplayable body")
+	})
+	_ = c.Request(http.MethodGet, "http://retry.example/", plainReader{strings.NewReader("body")}, nil, nil)
+	if got, want := tr.attempts.Load(), int32(1); got != want {
+		t.Errorf("attempts = %d, want %d", got, want)
+	}
+}
+
+func TestRetryReplaysRequestBody(t *testing.T) {
+	// A GET with a replayable body (bytes.Reader) is retried with the same
+	// body on every attempt.
+	var bodies []string
+	attempts := 0
+	tr := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		attempts++
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		if attempts < 3 {
+			return nil, transientErr()
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Request:    r,
+		}, nil
+	})
+	c := NewCollector(MaxRetries(3), RetryBackoff(0))
+	c.WithTransport(tr)
+	retries := 0
+	c.OnRetry(func(_ *Response, _ error, _ int) { retries++ })
+
+	if err := c.Request(http.MethodGet, "http://retry.example/", bytes.NewReader([]byte("payload")), nil, nil); err != nil {
+		t.Fatalf("Request failed after retries: %v", err)
+	}
+	if retries != 2 {
+		t.Errorf("OnRetry called %d times, want 2", retries)
+	}
+	if len(bodies) != 3 {
+		t.Fatalf("body read %d times, want 3", len(bodies))
+	}
+	for i, body := range bodies {
+		if body != "payload" {
+			t.Errorf("attempt %d body = %q, want %q", i+1, body, "payload")
+		}
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestRetryOnRetryResponseCarriesRequest(t *testing.T) {
+	tr := &retryTransport{
+		failUntil: 1,
+		err:       transientErr(),
+	}
+	c := NewCollector(MaxRetries(1), RetryBackoff(0))
+	c.WithTransport(tr)
+	var gotURL string
+	var gotRetry int
+	c.OnRetry(func(r *Response, err error, retry int) {
+		if r.Request == nil {
+			t.Error("OnRetry Response.Request is nil")
+			return
+		}
+		gotURL = r.Request.URL.String()
+		gotRetry = retry
+	})
+	_ = c.Visit("http://retry.example/")
+	if gotURL != "http://retry.example/" {
+		t.Errorf("OnRetry request URL = %q, want %q", gotURL, "http://retry.example/")
+	}
+	if gotRetry != 1 {
+		t.Errorf("OnRetry retry = %d, want 1", gotRetry)
+	}
+}
+
+func TestRetryOnRequestTimeout(t *testing.T) {
+	var attempts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) <= 2 {
+			time.Sleep(150 * time.Millisecond)
+		}
+		w.Write(serverIndexResponse)
+	}))
+	defer ts.Close()
+
+	c := NewCollector(MaxRetries(2), RetryBackoff(0))
+	c.SetRequestTimeout(50 * time.Millisecond)
+
+	retries := 0
+	c.OnRetry(func(r *Response, err error, retry int) {
+		retries++
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Errorf("OnRetry #%d error = %v, want a timeout error", retry, err)
+		}
+	})
+	got := ""
+	c.OnResponse(func(r *Response) { got = string(r.Body) })
+
+	// Every attempt uses a fresh request, so the retried requests get a new
+	// Client.Timeout budget instead of reusing the expired one.
+	if err := c.Visit(ts.URL); err != nil {
+		t.Fatalf("Visit failed after successful retries: %v", err)
+	}
+	if retries != 2 {
+		t.Errorf("OnRetry called %d times, want 2", retries)
+	}
+	if got != "hello world\n" {
+		t.Errorf("response body = %q, want %q", got, serverIndexResponse)
+	}
+	if n := attempts.Load(); n != 3 {
+		t.Errorf("server received %d requests, want 3", n)
+	}
+}
+
+func TestRetryRespectsCollectorContextCancellation(t *testing.T) {
+	tr := &retryTransport{
+		failUntil: 10,
+		err:       transientErr(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c := NewCollector(StdlibContext(ctx), MaxRetries(3), RetryBackoff(time.Second))
+	c.WithTransport(tr)
+	retries := 0
+	c.OnRetry(func(_ *Response, _ error, _ int) {
+		retries++
+		// Cancel while waiting for the backoff of the first retry.
+		cancel()
+	})
+	_ = c.Visit("http://retry.example/")
+
+	if retries != 1 {
+		t.Errorf("OnRetry called %d times, want 1 (retries stop once the context is cancelled)", retries)
+	}
+	if got := tr.attempts.Load(); got != 1 {
+		t.Errorf("attempts = %d, want 1", got)
+	}
+}
+
+func TestRetryAcrossRedirectChain(t *testing.T) {
+	// The first attempt times out after following the redirect, so the
+	// redirect target is already recorded as visited. The retry is a replay of
+	// the same logical request and must not fail with AlreadyVisitedError.
+	var slowHits atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/go" {
+			http.Redirect(w, r, "/slow", http.StatusFound)
+			return
+		}
+		if slowHits.Add(1) <= 2 {
+			time.Sleep(150 * time.Millisecond)
+		}
+		w.Write(serverIndexResponse)
+	}))
+	defer ts.Close()
+
+	c := NewCollector(MaxRetries(2), RetryBackoff(0))
+	c.SetRequestTimeout(50 * time.Millisecond)
+	retries := 0
+	c.OnRetry(func(_ *Response, _ error, _ int) { retries++ })
+	got := ""
+	c.OnResponse(func(r *Response) { got = string(r.Body) })
+
+	if err := c.Visit(ts.URL + "/go"); err != nil {
+		t.Fatalf("Visit failed after retries: %v", err)
+	}
+	if retries != 2 {
+		t.Errorf("OnRetry called %d times, want 2", retries)
+	}
+	if got != "hello world\n" {
+		t.Errorf("response body = %q, want %q", got, serverIndexResponse)
+	}
+}
+
+func TestRetryDoesNotDuplicateRevisitForFreshCollector(t *testing.T) {
+	// Sanity check that retries do not disable revisit checks for the
+	// Collector as a whole: a later, separate Visit is still rejected.
+	tr := &retryTransport{failUntil: 1, err: transientErr()}
+	c := NewCollector(MaxRetries(1), RetryBackoff(0))
+	c.WithTransport(tr)
+	if err := c.Visit("http://retry.example/"); err != nil {
+		t.Fatalf("first Visit failed: %v", err)
+	}
+	err := c.Visit("http://retry.example/")
+	var ave *AlreadyVisitedError
+	if !errors.As(err, &ave) {
+		t.Errorf("second Visit error = %v, want AlreadyVisitedError", err)
+	}
+}
+
+func TestRetryAsync(t *testing.T) {
+	tr := &retryTransport{failUntil: 2, err: transientErr()}
+	c := NewCollector(Async(), MaxRetries(3), RetryBackoff(0))
+	c.WithTransport(tr)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	retries := 0
+	c.OnRetry(func(_ *Response, _ error, _ int) { retries++ })
+	c.OnResponse(func(_ *Response) { wg.Done() })
+
+	if err := c.Visit("http://retry.example/"); err != nil {
+		t.Fatalf("Visit returned error: %v", err)
+	}
+	c.Wait()
+	wg.Wait()
+	if retries != 2 {
+		t.Errorf("OnRetry called %d times, want 2", retries)
+	}
+	if got := tr.attempts.Load(); got != 3 {
+		t.Errorf("attempts = %d, want 3", got)
+	}
+}
+
+func TestRetryDNSNotFoundNotRetried(t *testing.T) {
+	tr := &retryTransport{
+		failUntil: 10,
+		err: &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{
+			Err:        "no such host",
+			Name:       "nonexistent.invalid",
+			IsNotFound: true,
+		}},
+	}
+	c := NewCollector(MaxRetries(3), RetryBackoff(0))
+	c.WithTransport(tr)
+	c.OnRetry(func(_ *Response, _ error, _ int) {
+		t.Error("OnRetry called for a definitive DNS failure")
+	})
+	_ = c.Visit("http://nonexistent.invalid/")
+	if got, want := tr.attempts.Load(), int32(1); got != want {
+		t.Errorf("attempts = %d, want %d", got, want)
+	}
+}
+
+func TestRetryDNSTemporaryErrorRetried(t *testing.T) {
+	tr := &retryTransport{
+		failUntil: 1,
+		err: &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{
+			Err:         "server misbehaving",
+			Name:        "flaky.invalid",
+			IsTemporary: true,
+		}},
+	}
+	c := NewCollector(MaxRetries(1), RetryBackoff(0))
+	c.WithTransport(tr)
+	retried := false
+	c.OnRetry(func(_ *Response, _ error, _ int) { retried = true })
+	if err := c.Visit("http://flaky.invalid/"); err != nil {
+		t.Fatalf("Visit failed after retry: %v", err)
+	}
+	if !retried {
+		t.Error("OnRetry was not called for a temporary DNS failure")
 	}
 }
