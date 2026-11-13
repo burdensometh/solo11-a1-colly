@@ -1,3 +1,13 @@
+# Unreleased
+
+ - Queue: bounded InMemoryQueueStorage applies backpressure instead of dropping
+   requests; AddRequest blocks while the queue is full and returns ErrQueueClosed
+   after Stop
+ - Queue: periodic stats log line with backlog, consumption rate and total time
+   producers were blocked (Queue.MetricsInterval, Queue.Logger, Queue.Stats)
+ - Queue: Stop now drains the queue and Run honors Queue.ShutdownTimeout,
+   returning ErrShutdownTimeout if the queue cannot be drained in time
+
 # 2.1.0 - 2020.06.09
 
  - HTTP tracing support
